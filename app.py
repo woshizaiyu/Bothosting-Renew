@@ -294,6 +294,24 @@ def dismiss_consent_popup(sb, tag):
     return False
 
 
+# 安全点击：被遮挡（同意弹窗等）就先关闭再重试，最多 retries 次。
+def safe_click(sb, tag, selector, timeout=8, retries=3, label="按钮"):
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            sb.click(selector, timeout=timeout)
+            return True
+        except Exception as e:
+            last_err = e
+            print(f"{tag} ⚠️ {label}第 {attempt} 次点击失败: {str(e)[:150]}")
+            if dismiss_consent_popup(sb, tag):
+                print(f"{tag} 🔁 已关闭遮挡弹窗，重试点{label}...")
+                continue
+            if attempt < retries:
+                sb.sleep(2)
+    raise last_err
+
+
 # Turnstile 双层探测：① 票据（getResponse / cf-turnstile-response 隐藏域，前端 POST 就用它）；
 # ② 组件状态（iframe 内复选框）。票据为空但组件显示已解时也放行，后端 60s 轮询是最终裁判。
 def probe_turnstile(sb):
@@ -674,9 +692,10 @@ def renew_one_account(sb, acct) -> dict:
     # 点击外部续期按钮等待弹窗
     if outer_renew_selector:
         print(f"{tag} 🔄 点击外部续期按钮，等待验证窗口...")
+        dismiss_consent_popup(sb, tag)  # 弹窗可能延迟出现，点前再清一次
         try:
             sb.sleep(2)
-            sb.click(outer_renew_selector)
+            safe_click(sb, tag, outer_renew_selector, label="外部续期按钮")
             sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
         except Exception as e:
             print(f"{tag} ❌ 点击外部按钮失败: {e}")
@@ -721,7 +740,8 @@ def renew_one_account(sb, acct) -> dict:
             except Exception:
                 modal_text = "（文案不可读）"
             print(f"{tag} 📝 弹窗确认按钮文案: {modal_text.strip()!r}")
-            sb.click(modal_selector, timeout=8)
+            dismiss_consent_popup(sb, tag)  # 点前再清一次（弹窗可能后冒出来）
+            safe_click(sb, tag, modal_selector, label="弹窗确认按钮")
             print(f"{tag} ✅ 已点击续期按钮")
         except Exception as e:
             print(f"{tag} ❌ 弹窗确认按钮点击失败: {e}")
