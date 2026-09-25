@@ -173,6 +173,47 @@ def format_notification(status: str, email: str = "", login_method: str = "SESSI
     lines.append(f"⏱️ 登录时间: {now}")
     return "\n".join(lines)
 
+# 关闭 Google Funding Choices 同意弹窗（CI 干净 profile + EU 出口必弹，全屏遮罩挡点击）。
+# 找不到就静默返回，绝不抛异常。
+def dismiss_consent_popup(sb, tag):
+    try:
+        if sb.is_element_visible('button:contains("Do not consent")', timeout=3):
+            sb.click('button:contains("Do not consent")')
+            print(f"{tag} 🍪 已关闭同意弹窗（主文档）")
+            sb.sleep(1)
+            return True
+    except Exception:
+        pass
+    try:
+        iframes = sb.driver.find_elements("css selector", "iframe")
+    except Exception:
+        return False
+    for i in range(len(iframes)):
+        try:
+            sb.driver.switch_to.frame(i)
+            try:
+                btns = sb.driver.find_elements("xpath", ".//button[contains(., 'Do not consent')]")
+            except Exception:
+                btns = []
+            for b in btns:
+                try:
+                    if b.is_displayed():
+                        b.click()
+                        print(f"{tag} 🍪 已关闭同意弹窗（iframe#{i}）")
+                        sb.sleep(1)
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        finally:
+            try:
+                sb.driver.switch_to.default_content()
+            except Exception:
+                pass
+    return False
+
+
 # Turnstile 双层探测：① 票据（getResponse / cf-turnstile-response 隐藏域，前端 POST 就用它）；
 # ② 组件状态（iframe 内复选框）。票据为空但组件显示已解时也放行，后端 60s 轮询是最终裁判。
 def probe_turnstile(sb):
@@ -458,6 +499,7 @@ def renew_one_account(sb, acct) -> dict:
         sb.open("https://bot-hosting.net/")
         sb.wait_for_ready_state_complete()
         sb.sleep(2)
+        dismiss_consent_popup(sb, tag)
 
         print(f"{tag} 📝 注入 Cookie...")
         for name, value in cookies.items():
@@ -512,7 +554,8 @@ def renew_one_account(sb, acct) -> dict:
     if login_method == "Discord Token":
         print(f"{tag} ℹ️ 本次使用 Discord OAuth 登录，新的 SESSION_TOKEN 将自动更新到 Secrets")
 
-    # 提取当前到期日期
+    # 提取当前到期日期（先清同意弹窗，否则外层 Renew 点不到）
+    dismiss_consent_popup(sb, tag)
     sb.sleep(2)
     page_source = sb.get_page_source()
     current_expiry = extract_expiry_date(page_source)
