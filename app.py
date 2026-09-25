@@ -137,6 +137,86 @@ def update_github_secret(secret_name, new_value):
         print(f"❌ 异常: {e}")
         return False
 
+# API 预检：GET billings __data.json，用 freeRenewalOpensAt（续期窗口开启时间）做门控。
+# now >= opens → NEEDS_RENEW（走浏览器）；opens 在未来 → WAIT（免开浏览器）；
+# 解析失败/鉴权异常 → UNKNOWN/AUTH_FAIL（fail-open，照常走浏览器）。
+BILLINGS_DATA_URLS = [
+    "https://bot-hosting.net/a/billings/__data.json?x-sveltekit-invalidated=011",
+    "https://bot-hosting.net/a/billings/__data.json",
+]
+
+
+def parse_subscription(payload: str) -> dict:
+    """从 SvelteKit 脱水 JSON 里抠 subscription（值是同数组下标引用，需 resolve）。"""
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return {}
+    for node in data.get("nodes", []):
+        arr = node.get("data") if isinstance(node, dict) else None
+        if not isinstance(arr, list):
+            continue
+        for item in arr:
+            if isinstance(item, dict) and "freeRenewalDueAt" in item and "freeRenewalOpensAt" in item:
+                def sval(v):
+                    if isinstance(v, int) and 0 <= v < len(arr):
+                        v = arr[v]
+                    if isinstance(v, list) and v and v[0] == "Date":
+                        return v[1]
+                    return v
+                return {
+                    "status": sval(item.get("status")),
+                    "due": sval(item.get("freeRenewalDueAt")),
+                    "opens": sval(item.get("freeRenewalOpensAt")),
+                }
+    return {}
+
+
+def parse_iso(s: str):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def api_precheck(acct, proxy_server: str = "", is_proxy: bool = False) -> dict:
+    idx = acct["idx"]
+    sess = acct["session_token"]
+    if not sess:
+        return {"gate": "UNKNOWN", "detail": "无SESSION_TOKEN，浏览器兜底"}
+    from datetime import timezone
+    proxies = {"http": proxy_server, "https": proxy_server} if (is_proxy and proxy_server) else None
+    headers = {"User-Agent": DISCORD_UA, "Referer": "https://bot-hosting.net/a/billings", "Accept": "application/json"}
+    text, status = "", 0
+    try:
+        for url in BILLINGS_DATA_URLS:
+            r = requests.get(url, cookies={"session_token": sess, "login": "true"},
+                             headers=headers, proxies=proxies, timeout=20)
+            status = r.status_code
+            if status == 200 and "freeRenewalOpensAt" in r.text:
+                text = r.text
+                break
+            text = r.text
+    except Exception as e:
+        return {"gate": "UNKNOWN", "detail": f"请求异常: {e}"}
+    if status in (401, 403) or (text and "freeRenewalOpensAt" not in text
+                                and ("/login" in text or "sign in" in text.lower())):
+        return {"gate": "AUTH_FAIL", "detail": f"SESSION_TOKEN疑似失效(HTTP {status})，浏览器Discord兜底"}
+    sub = parse_subscription(text)
+    if not sub.get("opens"):
+        return {"gate": "UNKNOWN", "detail": "回包无窗口字段，浏览器兜底"}
+    now = datetime.now(timezone.utc)
+    opens = parse_iso(sub["opens"])
+    if not opens:
+        return {"gate": "UNKNOWN", "detail": "窗口时间解析失败，浏览器兜底"}
+    print(f"[账号{idx}] 🔍 API预检: 窗口开启 {sub['opens']} / 到期 {sub.get('due')} / 状态 {sub.get('status')}")
+    if now >= opens:
+        return {"gate": "NEEDS_RENEW", "due": sub.get("due"), "opens": sub.get("opens"),
+                "detail": "已到续期窗口，走浏览器"}
+    return {"gate": "WAIT", "due": sub.get("due"), "opens": sub.get("opens"),
+            "detail": f"未到窗口（{sub['opens']} 开）"}
+
+
 # 发送tg通知
 def send_telegram_message(message: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -795,32 +875,52 @@ def main():
     else:
         print("🍭 未使用代理，直连访问")
 
+    # 阶段1：API 预检分流（免开浏览器；fail-open，拿不准的照常走浏览器）
     results = {}
-    with SB(**sb_kwargs) as sb:
-        try:
-            ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
-            print(f"📍 当前出口IP: {ip}")
-        except Exception as e:
-            print(f"⚠️ 获取出口 IP 失败: {e}")
+    browser_queue = []
+    for acct in accounts:
+        idx = acct["idx"]
+        gate = api_precheck(acct, PROXY_SERVER if IS_PROXY else "", IS_PROXY)
+        print(f"[账号{idx}] 🔍 预检结论: {gate['gate']}（{gate.get('detail', '')}）")
+        if gate["gate"] == "WAIT":
+            send_telegram_message(format_notification(
+                "⏳ 未到续期时间", email=acct["email"] or f"账号{idx}",
+                login_method="API预检",
+                extra=f"⏱️ 窗口开启: {gate.get('opens')}",
+                expiry_date=gate.get("due") or "（未获取到）"))
+            results[idx] = {"ok": True, "summary": f"⏳ 未到时间（窗口 {gate.get('opens')}，到期 {gate.get('due')}）"}
+        else:
+            browser_queue.append(acct)
 
-        for acct in accounts:
-            idx = acct["idx"]
-            print("\n" + "=" * 40)
-            print(f"▶️ 开始处理 账号{idx}（{mask_email(acct['email'])}）")
-            print("=" * 40)
+    # 阶段2：只有需续期的账号才开浏览器
+    if not browser_queue:
+        print("🍭 所有账号都未到续期窗口，免开浏览器")
+    else:
+        with SB(**sb_kwargs) as sb:
             try:
-                results[idx] = renew_one_account(sb, acct)
+                ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
+                print(f"📍 当前出口IP: {ip}")
             except Exception as e:
-                print(f"[账号{idx}] ❌ 执行异常: {e}")
-                import traceback
-                traceback.print_exc()
-                results[idx] = {"ok": False, "summary": f"❌ 执行异常：{e}"}
+                print(f"⚠️ 获取出口 IP 失败: {e}")
+
+            for acct in browser_queue:
+                idx = acct["idx"]
+                print("\n" + "=" * 40)
+                print(f"▶️ 开始处理 账号{idx}（{mask_email(acct['email'])}）")
+                print("=" * 40)
                 try:
-                    send_telegram_message(format_notification(
-                        "❌ 续期失败", email=acct["email"] or f"账号{idx}",
-                        login_method="SESSION_TOKEN", error=f"执行异常：{e}"))
-                except Exception:
-                    pass
+                    results[idx] = renew_one_account(sb, acct)
+                except Exception as e:
+                    print(f"[账号{idx}] ❌ 执行异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    results[idx] = {"ok": False, "summary": f"❌ 执行异常：{e}"}
+                    try:
+                        send_telegram_message(format_notification(
+                            "❌ 续期失败", email=acct["email"] or f"账号{idx}",
+                            login_method="SESSION_TOKEN", error=f"执行异常：{e}"))
+                    except Exception:
+                        pass
 
     # 汇总通知
     print("\n🏁 全部账号执行完毕，汇总：")
