@@ -173,21 +173,54 @@ def format_notification(status: str, email: str = "", login_method: str = "SESSI
     lines.append(f"⏱️ 登录时间: {now}")
     return "\n".join(lines)
 
-# 等待 Turnstile 真正解出票据（前端 POST /api/billing/renew-free 用的就是这个值）。
-# 注意：扫主文档字符串是真空检查——挑战活在跨域 iframe 里，主文档本来就没有 CF 关键字。
+# Turnstile 双层探测：① 票据（getResponse / cf-turnstile-response 隐藏域，前端 POST 就用它）；
+# ② 组件状态（iframe 内复选框）。票据为空但组件显示已解时也放行，后端 60s 轮询是最终裁判。
+def probe_turnstile(sb):
+    token = ""
+    try:
+        token = sb.execute_script(
+            "var t='';"
+            "try{ if(typeof turnstile!=='undefined'&&turnstile.getResponse){t=turnstile.getResponse()||'';} }catch(e){}"
+            "if(!t){var h=document.querySelector('input[name=\"cf-turnstile-response\"]'); if(h){t=h.value||'';}}"
+            "return t;") or ""
+    except Exception:
+        token = ""
+    solved = False
+    dbg = []
+    try:
+        n = sb.execute_script(
+            "return document.querySelectorAll('iframe[src*=\"challenges.cloudflare.com\"]').length") or 0
+        dbg.append(f"iframes={n}")
+    except Exception as e:
+        dbg.append(f"iframes=?({str(e)[:60]})")
+    try:
+        sb.switch_to_frame('iframe[src*="challenges.cloudflare.com"]')
+        try:
+            state = sb.execute_script(
+                "var el=document.querySelector('input[type=\"checkbox\"]');"
+                "return el ? String(el.getAttribute('aria-checked')||el.checked) : 'no-checkbox';")
+            dbg.append(f"checkbox={state}")
+            solved = str(state).lower() == "true"
+        finally:
+            sb.switch_to_default_content()
+    except Exception as e:
+        dbg.append(f"frame-read-fail:{str(e)[:80]}")
+    return token, solved, "; ".join(dbg)
+
+
 def wait_for_turnstile_token(sb, timeout=30):
     start = time.time()
+    last_dbg = ""
     while time.time() - start < timeout:
-        try:
-            token = sb.execute_script(
-                "return (typeof turnstile !== 'undefined' && turnstile.getResponse) ? turnstile.getResponse() : ''")
-        except Exception:
-            token = ""
+        token, solved, last_dbg = probe_turnstile(sb)
         if token:
-            print(f"✅ Turnstile 票据已就绪（长度 {len(token)}）")
+            print(f"✅ Turnstile 票据已就绪（长度 {len(token)}）[{last_dbg}]")
+            return True
+        if solved:
+            print(f"⚠️ 未读到票据但组件显示已解，先放行由后端校验 [{last_dbg}]")
             return True
         time.sleep(2)
-    print("❌ Turnstile 票据超时未就绪")
+    print(f"❌ Turnstile 票据超时未就绪 [{last_dbg}]")
     return False
 
 # 获取当前出口ip
