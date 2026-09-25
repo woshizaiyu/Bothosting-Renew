@@ -173,18 +173,21 @@ def format_notification(status: str, email: str = "", login_method: str = "SESSI
     lines.append(f"⏱️ 登录时间: {now}")
     return "\n".join(lines)
 
-# 等待Turnstile验证通过
-def wait_for_turnstile_pass(sb, timeout=30):
+# 等待 Turnstile 真正解出票据（前端 POST /api/billing/renew-free 用的就是这个值）。
+# 注意：扫主文档字符串是真空检查——挑战活在跨域 iframe 里，主文档本来就没有 CF 关键字。
+def wait_for_turnstile_token(sb, timeout=30):
     start = time.time()
-    cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
     while time.time() - start < timeout:
-        page_lower = sb.get_page_source().lower()
-        if not any(x in page_lower for x in cf_indicators):
-            print("✅ Turnstile 验证已通过")
-            # sb.save_screenshot("turnstile_passed.png")
+        try:
+            token = sb.execute_script(
+                "return (typeof turnstile !== 'undefined' && turnstile.getResponse) ? turnstile.getResponse() : ''")
+        except Exception:
+            token = ""
+        if token:
+            print(f"✅ Turnstile 票据已就绪（长度 {len(token)}）")
             return True
-        sb.sleep(1)
-    print("❌ Turnstile 验证超时未通过")
+        time.sleep(2)
+    print("❌ Turnstile 票据超时未就绪")
     return False
 
 # 获取当前出口ip
@@ -525,9 +528,9 @@ def renew_one_account(sb, acct) -> dict:
             result["summary"] = "❌ 续期失败（点击按钮出错）"
             return result
 
-        # 处理弹窗中的 Turnstile
-        print(f"{tag} 🔒 检测弹窗中的 Turnstile 验证...")
-        turnstile_passed = False
+        # 处理弹窗中的 Turnstile：票据就绪后才能点确认（后端只认 turnstileToken）
+        print(f"{tag} 🔒 等待弹窗中的 Turnstile 票据...")
+        token_ok = False
         for attempt in range(1, 4):
             try:
                 sb.uc_gui_click_captcha()
@@ -535,39 +538,65 @@ def renew_one_account(sb, acct) -> dict:
             except Exception as e:
                 print(f"{tag} ⚠️ 点击 Turnstile 出错: {e}")
 
-            if wait_for_turnstile_pass(sb, timeout=20):
-                turnstile_passed = True
+            if wait_for_turnstile_token(sb, timeout=30):
+                token_ok = True
                 break
             else:
-                print(f"{tag} ⏳ 第 {attempt} 次未通过，重试点击...")
+                print(f"{tag} ⏳ 第 {attempt} 次未拿到票据，重试点击...")
 
-        if not turnstile_passed:
-            print(f"{tag} ❌ Turnstile 验证最终未通过，脚本退出")
-            send_telegram_message(format_notification("❌ 续期失败", email=email, login_method=login_method, error="Turnstile 验证未通过"))
+        if not token_ok:
+            print(f"{tag} ❌ Turnstile 票据最终未就绪，点确认也会被后端拒收，脚本退出")
+            try:
+                sb.save_screenshot(f"turnstile_fail_{idx}.png")
+            except Exception:
+                pass
+            send_telegram_message(format_notification("❌ 续期失败", email=email, login_method=login_method, error="Turnstile 票据未就绪（后端会拒收）"))
             result["summary"] = "❌ 续期失败（Turnstile 未通过）"
             return result
 
-        # 点击续期按钮
+        # 点击弹窗确认（录制 grounded：#renew-dialog 内按钮；文案不断言，只打印）
         print(f"{tag} ⏳ 等待续期按钮可用并点击...")
-        time.sleep(5)
-
-        modal_button_clicked = False
+        time.sleep(3)
+        modal_selector = "#renew-dialog button.inline-flex.w-full"
         try:
-            sb.click('button:contains("Renew for 4 days")', timeout=8)
-            modal_button_clicked = True
+            sb.wait_for_element_visible(modal_selector, timeout=10)
+            try:
+                modal_text = sb.get_text(modal_selector)
+            except Exception:
+                modal_text = "（文案不可读）"
+            print(f"{tag} 📝 弹窗确认按钮文案: {modal_text.strip()!r}")
+            sb.click(modal_selector, timeout=8)
             print(f"{tag} ✅ 已点击续期按钮")
         except Exception as e:
-            print(f"{tag} 续期按钮点击失败: {e}")
+            print(f"{tag} ❌ 弹窗确认按钮点击失败: {e}")
+            try:
+                sb.save_screenshot(f"modal_click_fail_{idx}.png")
+            except Exception:
+                pass
+            send_telegram_message(format_notification("❌ 续期失败", email=email, login_method=login_method, error=f"弹窗确认按钮点击失败: {str(e)[:120]}"))
+            result["summary"] = "❌ 续期失败（弹窗按钮点击失败）"
+            return result
 
-        print(f"{tag} ⏳ 等待新的过期时间...")
-        sb.sleep(6)
+        # 轮询确认结果（60s）：等倒计时或日期变化，替代固定 sleep(6)
+        print(f"{tag} ⏳ 等待新的过期时间（轮询60s）...")
+        new_expiry = None
+        new_countdown = None
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            sb.sleep(5)
+            new_page_text = sb.get_page_source()
+            new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
+            if new_match:
+                new_countdown = new_match.group(1)
+                new_expiry = extract_expiry_date(new_page_text)
+                break
+            cand = extract_expiry_date(new_page_text)
+            if cand and cand != current_expiry:
+                new_expiry = cand
+                break
 
         # 提取新的到期日期和倒计时
-        new_page_text = sb.get_page_source()
-        new_expiry = extract_expiry_date(new_page_text)
-        new_match = re.search(r"Renew in (\d{2}:\d{2}:\d{2})", new_page_text)
-        if new_match:
-            new_countdown = new_match.group(1)
+        if new_countdown:
             print(f"{tag} ✅ 续期成功！新的倒计时: {new_countdown}")
             if new_expiry:
                 print(f"{tag} 📅 新的到期日期: {new_expiry}")
@@ -582,7 +611,7 @@ def renew_one_account(sb, acct) -> dict:
             result["ok"] = True
             result["summary"] = f"✅ 续期成功（到期 {new_expiry or '未知'}）"
         else:
-            if new_expiry and new_expiry != current_expiry:
+            if new_expiry:
                 print(f"{tag} ✅ 续期成功，到期日期已更新为: {new_expiry}")
                 send_telegram_message(
                     format_notification(
@@ -596,11 +625,18 @@ def renew_one_account(sb, acct) -> dict:
                 result["summary"] = f"✅ 续期成功（到期 {new_expiry}）"
             else:
                 print(f"{tag} ⚠️ 续期结果未知，到期日期未变化，请手动检查")
+                try:
+                    sb.save_screenshot(f"renew_unknown_{idx}.png")
+                    body_txt = sb.get_text("body").strip().replace("\n", " ")[:300]
+                except Exception:
+                    body_txt = "（正文不可读）"
+                print(f"{tag} 📄 页面正文片段: {body_txt!r}")
                 send_telegram_message(
                     format_notification(
                         "⚠️ 续期可能未成功",
                         email=email, login_method=login_method,
                         extra="请登录后台检查",
+                        error=f"页面提示: {body_txt[:120]}",
                         expiry_date=current_expiry or "（未获取到）"
                     )
                 )
