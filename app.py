@@ -264,34 +264,75 @@ def dismiss_consent_popup(sb, tag):
             return True
     except Exception:
         pass
+    # 同源 shadow DOM 穿透找按钮（Funding Choices 偶尔包 shadow root）
     try:
-        iframes = sb.driver.find_elements("css selector", "iframe")
+        hit = sb.execute_script(
+            "function f(r){for(const el of r.querySelectorAll('*')){"
+            "if(el.shadowRoot){const x=f(el.shadowRoot);if(x)return x;}"
+            "if(el.tagName==='BUTTON'&&el.textContent&&el.textContent.includes('Do not consent'))return el;}"
+            "return null;}"
+            "var b=f(document); if(b){b.click(); return true;} return false;")
+        if hit:
+            print(f"{tag} 🍪 已关闭同意弹窗（shadow DOM）")
+            sb.sleep(1)
+            return True
     except Exception:
-        return False
-    for i in range(len(iframes)):
+        pass
+    # 递归扫 iframe（含嵌套两层），Funding Choices 通常是独立 iframe
+    def scan(depth):
         try:
-            sb.driver.switch_to.frame(i)
-            try:
-                btns = sb.driver.find_elements("xpath", ".//button[contains(., 'Do not consent')]")
-            except Exception:
-                btns = []
-            for b in btns:
-                try:
-                    if b.is_displayed():
-                        b.click()
-                        print(f"{tag} 🍪 已关闭同意弹窗（iframe#{i}）")
-                        sb.sleep(1)
-                        return True
-                except Exception:
-                    continue
+            n = len(sb.driver.find_elements("css selector", "iframe"))
         except Exception:
-            pass
-        finally:
+            return False
+        for i in range(n):
+            try:
+                sb.driver.switch_to.frame(i)
+                try:
+                    btns = sb.driver.find_elements("xpath", ".//button[contains(., 'Do not consent')]")
+                except Exception:
+                    btns = []
+                for b in btns:
+                    try:
+                        if b.is_displayed():
+                            b.click()
+                            print(f"{tag} 🍪 已关闭同意弹窗（iframe层{depth}#{i}）")
+                            sb.sleep(1)
+                            return True
+                    except Exception:
+                        continue
+                if depth < 2 and scan(depth + 1):
+                    return True
+            except Exception:
+                pass
+            finally:
+                try:
+                    sb.driver.switch_to.parent_frame()
+                except Exception:
+                    pass
+        return False
+    try:
+        if scan(0):
             try:
                 sb.driver.switch_to.default_content()
             except Exception:
                 pass
+            return True
+    except Exception:
+        pass
+    try:
+        sb.driver.switch_to.default_content()
+    except Exception:
+        pass
     return False
+
+
+# 续期点击门：先检测弹窗 → 有就关闭 → 再点续期；无弹窗直接点。日志留痕每一步。
+def ensure_clear_then_click(sb, tag, selector, label, timeout=8):
+    if dismiss_consent_popup(sb, tag):
+        print(f"{tag} 🍪 检测到遮挡弹窗，已关闭，继续点{label}")
+    else:
+        print(f"{tag} 🔍 未检测到遮挡弹窗，直接点{label}")
+    safe_click(sb, tag, selector, timeout=timeout, label=label)
 
 
 # 安全点击：被遮挡（同意弹窗等）就先关闭再重试，最多 retries 次。
@@ -692,10 +733,9 @@ def renew_one_account(sb, acct) -> dict:
     # 点击外部续期按钮等待弹窗
     if outer_renew_selector:
         print(f"{tag} 🔄 点击外部续期按钮，等待验证窗口...")
-        dismiss_consent_popup(sb, tag)  # 弹窗可能延迟出现，点前再清一次
         try:
             sb.sleep(2)
-            safe_click(sb, tag, outer_renew_selector, label="外部续期按钮")
+            ensure_clear_then_click(sb, tag, outer_renew_selector, "外部续期按钮")
             sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
         except Exception as e:
             print(f"{tag} ❌ 点击外部按钮失败: {e}")
@@ -740,8 +780,7 @@ def renew_one_account(sb, acct) -> dict:
             except Exception:
                 modal_text = "（文案不可读）"
             print(f"{tag} 📝 弹窗确认按钮文案: {modal_text.strip()!r}")
-            dismiss_consent_popup(sb, tag)  # 点前再清一次（弹窗可能后冒出来）
-            safe_click(sb, tag, modal_selector, label="弹窗确认按钮")
+            ensure_clear_then_click(sb, tag, modal_selector, "弹窗确认按钮")
             print(f"{tag} ✅ 已点击续期按钮")
         except Exception as e:
             print(f"{tag} ❌ 弹窗确认按钮点击失败: {e}")
